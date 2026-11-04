@@ -1,0 +1,45 @@
+{
+  "name": "dsh-vscode",
+  "version": "1.0.0",
+  "description": "DSH sidebar panel that bridges VS Code: launch VS Code, browse workspaces, send files (as attachments) to the current conversation, and edit code in a floating multi-tab workbench with live sync.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wenjun-81/dsh-vscode"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "vscode",
+    "plugin",
+    "sidebar"
+  ],
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

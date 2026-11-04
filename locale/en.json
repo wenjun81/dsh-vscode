@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "VScode",
+    "description": "VS Code bridge panel: launch VS Code, browse workspaces, send files as attachments to the current conversation, and edit code in a floating multi-tab workbench."
+  }
+}

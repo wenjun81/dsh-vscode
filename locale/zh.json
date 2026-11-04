@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "VScode",
+    "description": "VS Code 桥接面板：启动 VS Code、浏览工作区、把原文件附件发送给 DSH 当前对话，并用悬浮多标签工作台边编辑边与 DSH 对话。"
+  }
+}
