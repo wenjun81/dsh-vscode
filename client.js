@@ -340,7 +340,6 @@ window.__ModuleLoader__.load({
         const sessionId = sessionIdRef.current;
         if (!sessionId) {
           setStatus('未检测到打开的对话：请先在 DSH 中打开一个对话窗口，再发送文件');
-          call('logClient', { msg: 'sendFile aborted: no session' });
           return;
         }
         setSendState((prev) => Object.assign({}, prev, { [f.path]: 'sending' }));
@@ -392,7 +391,6 @@ window.__ModuleLoader__.load({
               item.data = data || undefined;
               if (size != null && size <= 8 * 1024 * 1024) item.text = base64ToText(data);
               else item.text = null;
-              call('logClient', { msg: 'stage read name=' + name + ' base64len=' + (data ? data.length : 0) });
             } catch (e) {
               call('logClient', { msg: 'stage reader threw ' + String((e && e.message) || e) });
               item.text = null;
@@ -439,12 +437,11 @@ window.__ModuleLoader__.load({
       }
 
       function pickFiles() {
-        if (typeof document === 'undefined') { call('logClient', { msg: 'pickFiles: document undefined' }); return; }
+        if (typeof document === 'undefined') return;
         let input;
         try {
           input = document.createElement('input');
         } catch (e) {
-          call('logClient', { msg: 'pickFiles: createElement threw ' + String((e && e.message) || e) });
           setStatus('无法创建文件选择框：' + String((e && e.message) || e));
           return;
         }
@@ -459,15 +456,12 @@ window.__ModuleLoader__.load({
           if (input && input.files) stageFiles(input.files);
         };
         document.body.appendChild(input);
-        call('logClient', { msg: 'pickFiles click before click()' });
         setStatus('正在打开文件选择对话框…');
         try {
           input.click();
         } catch (e) {
-          call('logClient', { msg: 'pickFiles click() threw ' + String((e && e.message) || e) });
           setStatus('打开文件选择对话框失败：' + String((e && e.message) || e));
         }
-        call('logClient', { msg: 'pickFiles click() returned' });
         setTimeout(() => { try { document.body.removeChild(input); } catch (e) { /* ignore */ } }, 5 * 60 * 1000);
       }
 
@@ -1328,7 +1322,7 @@ window.__ModuleLoader__.load({
           order: 25,
         }, WorkbenchOverlay));
         // 诊断探针：客户端半体加载成功即写宿主侧标记文件（供排查「刷新后无图标」）。
-        call('clientLoaded', { href: String((typeof location !== 'undefined' && location.href) || ''), now: Date.now(), version: '1.0.0', portal: canPortal });
+        call('clientLoaded', { href: String((typeof location !== 'undefined' && location.href) || ''), now: Date.now(), version: '1.1.1', portal: canPortal });
       },
     };
   },

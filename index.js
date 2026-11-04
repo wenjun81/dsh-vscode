@@ -65,7 +65,7 @@ const BINARY_EXT = new Set([
 ]);
 
 export const name = 'dsh-vscode';
-export const inject = ['subprocess', 'sessionController', 'fs', 'subagents', 'attachments', 'fileUploads'];
+export const inject = ['subprocess', 'sessionController', 'fs', 'subagents', 'fileUploads'];
 
 function appData() {
   try {
@@ -152,22 +152,6 @@ async function walk(fs, dirPath, rel, depth, acc) {
   }
 }
 
-function buildPrompt(filePath, text, truncated) {
-  const name = path.basename(filePath);
-  return [
-    '【DSH 侧边栏「VScode」提交的文件，请分析并回复】',
-    '文件路径：' + filePath,
-    '文件名：' + name,
-    '',
-    truncated
-      ? '提示：文件较大，内容已截断至前 ' + MAX_SEND_CHARS + ' 字符。'
-      : '文件内容（完整）：',
-    '<<<<< 文件开始：' + name + ' >>>>>',
-    text,
-    '<<<<< 文件结束 >>>>>',
-  ].join('\n');
-}
-
 async function findVsCode(subprocess, signal) {
   const base = appData();
   const candidates = [];
@@ -234,6 +218,31 @@ function isSubagentSession(chosen) {
 // 由 subagent routing 持有的会话（如 Agent Teams 的队内会话，origin==='subagent'）→ subagents.prompt
 // （sessionController 对该类会话一律拒绝："session ... is owned by subagent routing"，守卫无豁免，
 //  其受认可的投递路径即 subagents 服务的 @Remote('prompt')——与 GUI 客户端 Session.prompt() 的 subagent 分支一致）。
+// 对「会话正被另一写句柄持有」的瞬态错误做有限重试。
+// GUI 打开对话时会异步恢复 agent（open('write') 拿写句柄），恢复完成前任何新 prompt
+// 都被拒为 session/writer-held（"is already owned by an active write handle"）；
+// 恢复完成后 agent 变 live，prompt 即可成功。重试窗口约 6 秒，覆盖「刚打开对话就点发送」的竞态。
+async function withWriterHeldRetry(fn, signal) {
+  const MAX = 4;
+  let lastErr = null;
+  for (let attempt = 0; attempt < MAX; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const held = (e && e.code === 'session/writer-held')
+        || String((e && e.message) || e).includes('active write handle');
+      if (!held || (signal && signal.aborted)) throw e;
+      lastErr = e;
+      logSpawn('delivery writer-held attempt ' + (attempt + 1) + '/' + MAX + ' -> retry in 1.5s');
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  const err = new Error('当前对话正在初始化或被另一窗口占用，请稍候几秒再试；或先在该对话里发送一条普通消息，再重试发送');
+  err.code = 'session/writer-held-exhausted';
+  err.cause = lastErr;
+  throw err;
+}
+
 async function deliverTextToChosen(sessionController, subagents, chosen, promptText, signal) {
   const requestId = randomUUID();
   const content = [{ type: 'text', text: promptText }];
@@ -260,52 +269,56 @@ async function deliverTextToChosen(sessionController, subagents, chosen, promptT
         },
       };
     } catch (e) {
-      return { ok: false, error: { code: 'subagent-delivery-failed', message: '发送失败：' + String((e && e.message) || e), details: {} } };
+      return { ok: false, error: { code: 'subagent-delivery-failed', message: String((e && e.message) || e), details: {} } };
     }
   }
   try {
-    const result = await sessionController.prompt({ requestId, sessionId: chosen.sessionId, mode: 'queue', content }, signal);
+    const result = await withWriterHeldRetry(
+      () => sessionController.prompt({ requestId, sessionId: chosen.sessionId, mode: 'queue', content }, signal),
+      signal,
+    );
     return { ok: true, value: { accepted: !!(result && result.accepted), sessionId: chosen.sessionId, deliveredVia: 'session' } };
   } catch (e) {
-    return { ok: false, error: { code: 'prompt-failed', message: '发送失败：' + String((e && e.message) || e), details: {} } };
+    return { ok: false, error: { code: 'prompt-failed', message: String((e && e.message) || e), details: {} } };
   }
 }
 
-async function deliverPrompt(sessionController, subagents, promptText, signal, targetSessionId) {
-  const resolved = await resolveTargetSession(sessionController, targetSessionId, signal);
-  if (!resolved.ok) return resolved;
-  return deliverTextToChosen(sessionController, subagents, resolved.chosen, promptText, signal);
+// 文本降级：把文件字节转成 UTF-8 文本，经 deliverTextToChosen 投递（附说明 note）。
+// 供三路复用：subagent 会话不支持附件 / uploadStream 暂存失败 / prompt 投递失败。
+async function deliverTextFallback(sessionController, subagents, chosen, bytes, name, note, failMsg, signal) {
+  const isBinary = looksBinary(bytes);
+  let text = '';
+  if (!isBinary) { try { text = Buffer.from(bytes).toString('utf8'); } catch (e) { text = ''; } }
+  if (!text) {
+    return { ok: false, error: { code: 'file-unsupported', message: failMsg || (note + '（文件不是文本，无法降级）'), details: {} } };
+  }
+  let finalText = text;
+  let truncated = false;
+  if (finalText.length > MAX_SEND_CHARS) { finalText = finalText.slice(0, MAX_SEND_CHARS); truncated = true; }
+  const promptText = [
+    '【DSH 侧边栏「VScode」提交的文件，请分析并回复】',
+    '文件名：' + name,
+    '说明：' + note + (truncated ? '（已截断至前 ' + MAX_SEND_CHARS + ' 字符）' : '（完整）') + '。',
+    '<<<<< 文件开始：' + name + ' >>>>>',
+    finalText,
+    '<<<<< 文件结束 >>>>>',
+  ].join('\n');
+  const result = await deliverTextToChosen(sessionController, subagents, chosen, promptText, signal);
+  logSpawn('attachment text-fallback ' + (result && result.ok ? 'ok' : 'failed err=' + String((result && result.error && result.error.message) || result)));
+  if (result && result.ok && result.value) result.value.viaAttachment = false;
+  return result;
 }
 
 // v0.9.2：把【原文件字节】作为附件投递给 chosen 会话（供「发送给 DSH」与「自动同步」共用）。
 // subagent 持有的会话不支持附件：文本文件自动降级为文本内容，二进制文件明确报错。
-async function deliverAttachmentBytes(sessionController, subagents, attachments, fileUploads, chosen, bytes, name, signal) {
+async function deliverAttachmentBytes(sessionController, subagents, fileUploads, chosen, bytes, name, signal) {
   if (isSubagentSession(chosen)) {
-    const isBinary = looksBinary(bytes);
-    let text = '';
-    if (!isBinary) { try { text = Buffer.from(bytes).toString('utf8'); } catch (e) { text = ''; } }
-    if (!text) {
-      return { ok: false, error: { code: 'subagent-file-unsupported', message: '当前对话由子代理路由持有，不支持发送原文件附件；请切换回普通对话后重试', details: {} } };
-    }
-    let finalText = text;
-    let truncated = false;
-    if (finalText.length > MAX_SEND_CHARS) { finalText = finalText.slice(0, MAX_SEND_CHARS); truncated = true; }
-    const promptText = [
-      '【DSH 侧边栏「VScode」提交的文件，请分析并回复】',
-      '文件名：' + name,
-      '说明：当前对话由子代理路由持有，不支持附件，以下为文件文本内容' + (truncated ? '（已截断至前 ' + MAX_SEND_CHARS + ' 字符）' : '（完整）') + '。',
-      '<<<<< 文件开始：' + name + ' >>>>>',
-      finalText,
-      '<<<<< 文件结束 >>>>>',
-    ].join('\n');
-    const result = await deliverTextToChosen(sessionController, subagents, chosen, promptText, signal);
-    if (result && result.ok && result.value) result.value.viaAttachment = false;
-    return result;
+    return deliverTextFallback(sessionController, subagents, chosen, bytes, name,
+      '当前对话由子代理路由持有，不支持附件，以下为文件文本内容',
+      '当前对话由子代理路由持有，不支持发送原文件附件；请切换回普通对话后重试', signal);
   }
-
   // 官方投递协议（dsh-api-session-controller resolvePromptFileReceipts）：prompt 的 file 块必须携带
   // receiptId，且该 receipt 必须由 fileUploads.uploadStream({sessionId}) 为同一会话暂存（staged）。
-  // 直接 attachments.saveFile 的引用不带会话暂存 → 必被拒 "File was not uploaded for this session."。
   let receiptId;
   let fileRef;
   if (fileUploads && typeof fileUploads.uploadStream === 'function') {
@@ -314,30 +327,21 @@ async function deliverAttachmentBytes(sessionController, subagents, attachments,
       const upload = await fileUploads.uploadStream({ sessionId: chosen.sessionId, data: chunks, name });
       receiptId = upload && upload.receiptId;
       fileRef = upload && upload.file;
-      logSpawn('attachment uploadStream-ok receiptId=' + (receiptId || '(none)') + ' attachmentId=' + (fileRef && fileRef.attachmentId) + ' bytes=' + (fileRef && fileRef.bytes));
     } catch (e) {
-      logSpawn('attachment uploadStream-failed err=' + String((e && e.message) || e) + ' -> trying saveFile');
-    }
-  } else {
-    logSpawn('attachment uploadStream unavailable');
-  }
-  if (!receiptId && attachments && typeof attachments.saveFile === 'function') {
-    try { fileRef = await attachments.saveFile({ data: bytes, name }); } catch (e) {
-      logSpawn('attachment saveFile-failed err=' + String((e && e.message) || e));
+      logSpawn('attachment uploadStream-failed err=' + String((e && e.message) || e) + ' -> text-fallback');
     }
   }
-  if (!receiptId && !fileRef) {
-    return { ok: false, error: { code: 'save-file-failed', message: '附件保存失败：uploadStream 与 saveFile 均不可用（详见探针日志）', details: {} } };
+  if (!receiptId) {
+    return deliverTextFallback(sessionController, subagents, chosen, bytes, name,
+      '附件暂存不可用，已降级为文本内容', '附件暂存不可用，且文件不是文本，无法发送', signal);
   }
-  logSpawn('attachment ref-ok receiptId=' + (receiptId || '(none)') + ' attachmentId=' + (fileRef && fileRef.attachmentId) + ' bytes=' + (fileRef && fileRef.bytes));
   const requestId = randomUUID();
   const intro = '【DSH 侧边栏「VScode」提交的原文件，请分析并回复】\n文件名：' + name + '\n大小：' + ((fileRef && fileRef.bytes) || bytes.length) + ' 字节';
-  const content = receiptId
-    ? [{ type: 'file', receiptId }, { type: 'text', text: intro }]
-    : [{ type: 'file', attachment: fileRef }, { type: 'text', text: intro }];
   try {
-    const result = await sessionController.prompt({ requestId, sessionId: chosen.sessionId, mode: 'queue', content }, signal);
-    logSpawn('attachment prompt-ok accepted=' + !!(result && result.accepted));
+    const result = await withWriterHeldRetry(
+      () => sessionController.prompt({ requestId, sessionId: chosen.sessionId, mode: 'queue', content: [{ type: 'file', receiptId }, { type: 'text', text: intro }] }, signal),
+      signal,
+    );
     return {
       ok: true,
       value: {
@@ -351,27 +355,9 @@ async function deliverAttachmentBytes(sessionController, subagents, attachments,
       },
     };
   } catch (e) {
-    logSpawn('attachment prompt-failed err=' + String((e && e.message) || e) + ' -> trying text-fallback');
-    let t2 = '';
-    try { t2 = Buffer.from(bytes).toString('utf8'); } catch (e2) { t2 = ''; }
-    if (t2) {
-      let finalText = t2;
-      let truncated = false;
-      if (finalText.length > MAX_SEND_CHARS) { finalText = finalText.slice(0, MAX_SEND_CHARS); truncated = true; }
-      const promptText = [
-        '【DSH 侧边栏「VScode」提交的文件，请分析并回复】',
-        '文件名：' + name,
-        '说明：附件投递失败（' + String((e && e.message) || e) + '），已降级为文本内容' + (truncated ? '（截断至前 ' + MAX_SEND_CHARS + ' 字符）' : '（完整）') + '。',
-        '<<<<< 文件开始：' + name + ' >>>>>',
-        finalText,
-        '<<<<< 文件结束 >>>>>',
-      ].join('\n');
-      const res2 = await deliverTextToChosen(sessionController, subagents, chosen, promptText, signal);
-      logSpawn('attachment text-fallback ' + (res2 && res2.ok ? 'ok' : 'failed err=' + String((res2 && res2.error && res2.error.message) || res2)));
-      if (res2 && res2.ok && res2.value) res2.value.viaAttachment = false;
-      return res2;
-    }
-    return { ok: false, error: { code: 'prompt-failed', message: '发送失败：' + String((e && e.message) || e), details: {} } };
+    logSpawn('attachment prompt-failed err=' + String((e && e.message) || e) + ' -> text-fallback');
+    return deliverTextFallback(sessionController, subagents, chosen, bytes, name,
+      '附件投递失败（' + String((e && e.message) || e) + '），已降级为文本内容', undefined, signal);
   }
 }
 
@@ -381,10 +367,26 @@ function looksBinary(buf) {
   return false;
 }
 
+// spawn VS Code 子进程并吞掉结局（VS Code 常驻运行，不等待退出；仅吞掉结局避免 unhandled rejection）。
+async function launchVsCode(subprocess, spec, tag, value) {
+  try {
+    const handle = subprocess.spawn(spec);
+    logSpawn(tag + ' spawn-ok');
+    handle.done.then(
+      (r) => logSpawn(tag + ' done exit=' + (r && r.exitCode) + ' signal=' + (r && r.signal)),
+      (e) => logSpawn(tag + ' done-rejected err=' + String((e && e.message) || e))
+    );
+    handle.done.catch(() => {});
+    return { ok: true, value: Object.assign({ launched: true }, value) };
+  } catch (e) {
+    logSpawn(tag + ' spawn-THROW err=' + String((e && e.message) || e));
+    return { ok: false, error: { code: 'spawn-failed', message: '启动 VS Code 失败：' + String((e && e.message) || e), details: {} } };
+  }
+}
+
 function createHandler(ctx) {
   const { fs, subprocess, sessionController } = ctx;
   const subagents = ctx.subagents || (typeof ctx.get === 'function' ? ctx.get('subagents') : undefined);
-  const attachments = ctx.attachments || (typeof ctx.get === 'function' ? ctx.get('attachments') : undefined);
   const fileUploads = ctx.fileUploads || (typeof ctx.get === 'function' ? ctx.get('fileUploads') : undefined);
   // 工作台「自动同步」：path → { close, timer, sessionId, lastText }
   const syncs = new Map();
@@ -406,18 +408,8 @@ function createHandler(ctx) {
             graceMs: 3000,
             env: spawnEnv,
           };
-          try {
-            const handle = subprocess.spawn(spec);
-            logSpawn('openVsCode custom-spawn-ok ' + (isLnk ? 'lnk=' : 'exe=') + custom);
-            handle.done.then(
-              (r) => logSpawn('openVsCode custom-done exit=' + (r && r.exitCode) + ' signal=' + (r && r.signal)),
-              (e) => logSpawn('openVsCode custom-done-rejected err=' + String((e && e.message) || e))
-            );
-            handle.done.catch(() => {});
-            return { ok: true, value: { launched: true, exe: custom, kind: isLnk ? 'shortcut' : 'custom', workspace: null } };
-          } catch (e) {
-            logSpawn('openVsCode custom-spawn-THROW err=' + String((e && e.message) || e) + ' -> fallback');
-          }
+          const r = await launchVsCode(subprocess, spec, 'openVsCode custom', { exe: custom, kind: isLnk ? 'shortcut' : 'custom', workspace: null });
+          if (r.ok) return r;
         }
         // 2) Windows：桌面快捷方式（fs.stat 直接吃裸路径会被按相对路径解析而失败——必须先 fs.resolve()）。
         const lnk = desktopLnkPath();
@@ -440,18 +432,8 @@ function createHandler(ctx) {
             graceMs: 3000,
             env: spawnEnv,
           };
-          try {
-            const handle = subprocess.spawn(spec);
-            logSpawn('openVsCode lnk-spawn-ok lnk=' + lnk);
-            handle.done.then(
-              (r) => logSpawn('openVsCode lnk-done exit=' + (r && r.exitCode) + ' signal=' + (r && r.signal)),
-              (e) => logSpawn('openVsCode lnk-done-rejected err=' + String((e && e.message) || e))
-            );
-            handle.done.catch(() => {});
-            return { ok: true, value: { launched: true, exe: lnk, kind: 'shortcut', workspace: null } };
-          } catch (e) {
-            logSpawn('openVsCode lnk-spawn-THROW err=' + String((e && e.message) || e) + ' -> fallback to exe');
-          }
+          const r = await launchVsCode(subprocess, spec, 'openVsCode lnk', { exe: lnk, kind: 'shortcut', workspace: null });
+          if (r.ok) return r;
         } else if (process.platform === 'win32' && ACTIVE_CFG.desktopShortcut && lnk) {
           logSpawn('openVsCode lnk-missing path=' + lnk);
         }
@@ -466,21 +448,7 @@ function createHandler(ctx) {
           graceMs: 3000,
           env: { ...process.env, ELECTRON_RUN_AS_NODE: '' },
         };
-        let handle;
-        try {
-          handle = subprocess.spawn(spec);
-        } catch (e) {
-          logSpawn('openVsCode spawn-THROW exe=' + exe + ' err=' + String((e && e.message) || e));
-          return { ok: false, error: { code: 'spawn-failed', message: '启动 VS Code 失败：' + String((e && e.message) || e), details: {} } };
-        }
-        // VS Code 常驻运行，不等待退出；仅吞掉结局避免 unhandled rejection。
-        logSpawn('openVsCode spawn-ok exe=' + exe + ' workspace=' + (workspace || '(none)'));
-        handle.done.then(
-          (r) => logSpawn('openVsCode done exe=' + exe + ' exit=' + (r && r.exitCode) + ' signal=' + (r && r.signal)),
-          (e) => logSpawn('openVsCode done-rejected exe=' + exe + ' err=' + String((e && e.message) || e))
-        );
-        handle.done.catch(() => {});
-        return { ok: true, value: { launched: true, exe, workspace: workspace || null } };
+        return launchVsCode(subprocess, spec, 'openVsCode exe', { exe, workspace: workspace || null });
       }
 
       if (endpoint === 'openFileInVsCode') {
@@ -508,20 +476,7 @@ function createHandler(ctx) {
           graceMs: 3000,
           env: { ...process.env, ELECTRON_RUN_AS_NODE: '' },
         };
-        let handle2;
-        try {
-          handle2 = subprocess.spawn(spec);
-        } catch (e) {
-          logSpawn('openFileInVsCode spawn-THROW exe=' + exe + ' file=' + filePath + ' err=' + String((e && e.message) || e));
-          return { ok: false, error: { code: 'spawn-failed', message: '启动 VS Code 失败：' + String((e && e.message) || e), details: {} } };
-        }
-        logSpawn('openFileInVsCode spawn-ok exe=' + exe + ' file=' + filePath);
-        handle2.done.then(
-          (r) => logSpawn('openFileInVsCode done exe=' + exe + ' exit=' + (r && r.exitCode) + ' signal=' + (r && r.signal)),
-          (e) => logSpawn('openFileInVsCode done-rejected exe=' + exe + ' err=' + String((e && e.message) || e))
-        );
-        handle2.done.catch(() => {});
-        return { ok: true, value: { launched: true, file: filePath } };
+        return launchVsCode(subprocess, spec, 'openFileInVsCode', { file: filePath });
       }
 
       if (endpoint === 'detectWorkspace') {
@@ -537,29 +492,8 @@ function createHandler(ctx) {
         return { ok: true, value: { workspace: ws, files: acc.files, truncated: acc.truncated } };
       }
 
-      if (endpoint === 'sendFileToDsh') {
-        const filePath = payload && typeof payload.path === 'string' && payload.path ? payload.path : undefined;
-        if (!filePath) return { ok: false, error: { code: 'bad-request', message: '缺少文件路径', details: {} } };
-        const ext = path.extname(filePath).slice(1).toLowerCase();
-        if (BINARY_EXT.has(ext)) {
-          return { ok: false, error: { code: 'unsupported', message: '不支持发送该文件类型：.' + ext, details: {} } };
-        }
-        let target;
-        try { target = await fs.resolve(filePath); } catch (e) {
-          return { ok: false, error: { code: 'resolve-failed', message: '无法解析路径：' + String((e && e.message) || e), details: {} } };
-        }
-        let text;
-        try { text = await fs.readText(target, signal); } catch (e) {
-          return { ok: false, error: { code: 'read-failed', message: '读取失败：' + String((e && e.message) || e), details: {} } };
-        }
-        let truncated = false;
-        if (text.length > MAX_SEND_CHARS) { text = text.slice(0, MAX_SEND_CHARS); truncated = true; }
-        const sessionId = payload && typeof payload.sessionId === 'string' && payload.sessionId ? payload.sessionId : undefined;
-        return deliverPrompt(sessionController, subagents, buildPrompt(filePath, text, truncated), signal, sessionId);
-      }
-
       if (endpoint === 'sendFileAttachmentToDsh') {
-        // 发送【原文件】（作为附件，而非文本内容）：读原始字节 → attachments.saveFile → prompt 携带 file 块。
+        // 发送【原文件】（作为附件，而非文本内容）：读原始字节 → uploadStream 暂存 → prompt 携带 receiptId file 块。
         // 普通会话走 sessionController.prompt；subagent 持有的会话不支持附件（官方同款限制），
         // 文本类文件自动退化为发送文本内容，二进制文件明确报错。
         const sessionId = payload && typeof payload.sessionId === 'string' && payload.sessionId ? payload.sessionId : undefined;
@@ -606,41 +540,7 @@ function createHandler(ctx) {
         const chosen = resolved.chosen;
         logSpawn('sendFileAttachment target=' + chosen.sessionId + ' origin=' + (chosen.origin || 'plain') + ' parent=' + (chosen.parentSessionId || '(none)'));
 
-        return deliverAttachmentBytes(sessionController, subagents, attachments, fileUploads, chosen, bytes, name, signal);
-      }
-
-      if (endpoint === 'sendTextToDsh') {
-        const fileName = (payload && typeof payload.name === 'string' && payload.name) || '拖拽文件.txt';
-        const text = payload && typeof payload.text === 'string' ? payload.text : undefined;
-        if (text === undefined) return { ok: false, error: { code: 'bad-request', message: '缺少文本内容', details: {} } };
-        let finalText = text;
-        let truncated = false;
-        if (finalText.length > MAX_SEND_CHARS) { finalText = finalText.slice(0, MAX_SEND_CHARS); truncated = true; }
-        const sessionId = payload && typeof payload.sessionId === 'string' && payload.sessionId ? payload.sessionId : undefined;
-        return deliverPrompt(sessionController, subagents, buildPrompt(fileName, finalText, truncated), signal, sessionId);
-      }
-
-      if (endpoint === 'listSessions') {
-        try {
-          const list = await sessionController.list({}, signal);
-          const items = (list && list.items) || [];
-          return {
-            ok: true,
-            value: {
-              sessions: items.slice(0, 10).map((s) => ({
-                sessionId: s.sessionId,
-                running: !!s.running,
-                blank: !!s.blank,
-                updatedAt: s.updatedAt,
-                cwd: s.cwd,
-                origin: s.origin || null,
-                parentSessionId: s.parentSessionId || null,
-              })),
-            },
-          };
-        } catch (e) {
-          return { ok: false, error: { code: 'list-failed', message: String((e && e.message) || e), details: {} } };
-        }
+        return deliverAttachmentBytes(sessionController, subagents, fileUploads, chosen, bytes, name, signal);
       }
 
       if (endpoint === 'clientLoaded') {
@@ -720,7 +620,7 @@ function createHandler(ctx) {
           try {
             let bytes;
             try { bytes = await fs.readBytes(target, undefined, MAX_ATTACH_BYTES); } catch (e) {
-              logSpawn('syncStart read-bytes-failed path=' + filePath + ' err=' + String((e && e.message) || e));
+              logSpawn('syncStart fire-failed stage=read-bytes path=' + filePath + ' err=' + String((e && e.message) || e));
               return;
             }
             if (!bytes || !bytes.length) return;
@@ -729,14 +629,14 @@ function createHandler(ctx) {
             entry.lastText = text;
             const resolved = await resolveTargetSession(sessionController, sessionId, signal);
             if (!resolved.ok) {
-              logSpawn('syncStart resolve-failed err=' + String((resolved.error && resolved.error.message) || resolved.error));
+              logSpawn('syncStart fire-failed stage=resolve err=' + String((resolved.error && resolved.error.message) || resolved.error));
               return;
             }
-            const result = await deliverAttachmentBytes(sessionController, subagents, attachments, fileUploads, resolved.chosen, bytes, path.basename(filePath), signal);
-            if (!result || !result.ok) logSpawn('syncStart send-failed path=' + filePath + ' err=' + ((result && result.error && result.error.message) || 'unknown'));
-            else logSpawn('syncStart attachment-ok path=' + filePath + ' viaAttachment=' + !!(result.value && result.value.viaAttachment) + ' bytes=' + bytes.length);
+            const result = await deliverAttachmentBytes(sessionController, subagents, fileUploads, resolved.chosen, bytes, path.basename(filePath), signal);
+            if (result && result.ok) logSpawn('syncStart attachment-ok path=' + filePath + ' viaAttachment=' + !!(result.value && result.value.viaAttachment) + ' bytes=' + bytes.length);
+            else logSpawn('syncStart fire-failed stage=send path=' + filePath + ' err=' + ((result && result.error && result.error.message) || 'unknown'));
           } catch (e) {
-            logSpawn('syncStart read-failed path=' + filePath + ' err=' + String((e && e.message) || e));
+            logSpawn('syncStart fire-failed stage=unexpected path=' + filePath + ' err=' + String((e && e.message) || e));
           }
         };
         const onChanged = () => {
