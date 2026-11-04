@@ -23,7 +23,7 @@ DeepSeek Harness（DSH）侧边栏插件：把 VS Code 桥接进 DSH 对话。
 1. 获取插件目录（二选一）：
 
 ```powershell
-git clone https://github.com/wenjun-81/dsh-vscode
+git clone https://github.com/wenjun81/dsh-vscode
 # 或下载源码 zip 解压
 ```
 
