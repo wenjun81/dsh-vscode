@@ -64,7 +64,7 @@ const BINARY_EXT = new Set([
   'db', 'sqlite', 'sqlite3', 'pyc', 'pyo', 'lnk', 'bin', 'dat', 'iso', 'img', 'lock',
 ]);
 
-export const name = 'dsh-vscode';
+export const name = '@wenjun81/dsh-vscode';
 export const inject = ['subprocess', 'sessionController', 'fs', 'subagents', 'fileUploads'];
 
 function appData() {

@@ -6,7 +6,7 @@
 // 隐私声明：本插件不采集任何数据；clientLoaded 探针仅在宿主 config.probeEnabled=true 时才落盘（默认关闭）。
 // 发送目标=「当前打开的对话」（uiSession 服务取会话 id 传给宿主精确投递），避免误投后台子代理会话。
 window.__ModuleLoader__.load({
-  id: 'dsh-vscode',
+  id: '@wenjun81/dsh-vscode',
   factory(require) {
     const React = require('react');
     const { createElement: h, useState, useEffect, useMemo, useRef } = React;

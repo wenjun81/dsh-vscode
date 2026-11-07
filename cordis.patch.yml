@@ -1,4 +1,4 @@
 - insert:
-    - id: dsh-vscode
-      name: 'dsh-vscode'
+    - id: '@wenjun81/dsh-vscode'
+      name: '@wenjun81/dsh-vscode'
       config: {}

@@ -38,12 +38,14 @@ npm install <dsh-vscode 目录的绝对路径>
 
 ```json
 {
-  "dependencies": { "dsh-vscode": "<上一步安装出的版本或链接>" },
-  "dsh": { "profile": { "bundles": ["dsh-vscode"] } }
+  "dependencies": { "@wenjun81/dsh-vscode": "<上一步安装出的版本或链接>" },
+  "dsh": { "profile": { "bundles": ["@wenjun81/dsh-vscode"] } }
 }
 ```
 
 4. 在 DSH 插件管理器中启用「dsh-vscode」，刷新页面，左侧边栏出现「VScode」入口。
+
+> npm 发布后也可直接 `npm install @wenjun81/dsh-vscode`（目前以 GitHub 获取为准）。
 
 ## 配置
 
@@ -51,8 +53,8 @@ npm install <dsh-vscode 目录的绝对路径>
 
 ```yaml
 - insert:
-    - id: dsh-vscode
-      name: 'dsh-vscode'
+    - id: '@wenjun81/dsh-vscode'
+      name: '@wenjun81/dsh-vscode'
       config:
         # 自定义 VS Code 可执行文件路径；Windows 上也可以是 .lnk 快捷方式。空 = 自动探测。
         vscodePath: ''
