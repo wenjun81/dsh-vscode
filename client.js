@@ -46,6 +46,7 @@ window.__ModuleLoader__.load({
     // 重新打开只显示空白编辑器（不自动显示上次文件）。
     const wbStore = {
       open: false,
+      handleY: undefined,           // 右侧把手纵向位置（px）；undefined = 视口 42%
       x: undefined, y: undefined,   // 拖动后的显式坐标；undefined = 默认右下角
       w: 660, h: 430,               // 卡片宽高（可缩放）
       fontSize: 13,                 // 编辑器字号（10-40）
@@ -1057,9 +1058,16 @@ window.__ModuleLoader__.load({
       }
 
       const fontSize = wbStore.fontSize;
+      // v1.1.2：行号栏（参考 VS Code 编辑器左侧行号，等宽字体、随垂直滚动同步）。
+      const lineCount = (wbText || '').split('\n').length;
+      const gutterDigits = String(lineCount).length;
+      const gutterWidth = Math.round((gutterDigits + 1) * fontSize * 0.62) + 12;
+      let gutterText = '';
+      for (let i = 1; i <= lineCount; i++) gutterText += (i === lineCount ? String(i) : i + '\n');
       const codeStyle = {
         fontFamily: 'Consolas, Menlo, "Courier New", monospace',
         fontSize: fontSize + 'px', lineHeight: 1.5, padding: 10,
+        paddingLeft: 10 + gutterWidth,
         whiteSpace: 'pre', boxSizing: 'border-box', width: '100%', height: '100%',
         tabSize: 4,
       };
@@ -1075,10 +1083,35 @@ window.__ModuleLoader__.load({
         return tokens.map((tk, idx) => (tk.t === 'plain' ? tk.s : h('span', { key: idx, style: { color: HL_COLORS[tk.t] } }, tk.s)));
       }, [wbText, wbName, wbPath, wbStore.lang]);
 
-      // ---- 右侧边栏入口：关闭时在右边缘显示「工作台」把手 ----
+      // ---- 右侧边栏入口：关闭时在右边缘显示「工作台」把手（v1.1.2：可沿右侧上下自由拖动） ----
+      const handleTop = wbStore.handleY === undefined ? '42%' : wbStore.handleY;
+      const beginHandleDrag = (ev) => {
+        if (typeof ev.button === 'number' && ev.button !== 0) return;
+        const el = ev.currentTarget;
+        const rect = el.getBoundingClientRect();
+        const startY = ev.clientY;
+        const startTop = rect.top;
+        const height = rect.height;
+        let moved = false;
+        const move = (e2) => {
+          const dy = e2.clientY - startY;
+          if (!moved && Math.abs(dy) <= 4) return;
+          moved = true;
+          const top = Math.max(8, Math.min((window.innerHeight || 800) - height - 8, startTop + dy));
+          setWb({ handleY: Math.round(top) });
+        };
+        const up = () => {
+          document.removeEventListener('pointermove', move);
+          document.removeEventListener('pointerup', up);
+          if (!moved) setWb({ open: true });
+        };
+        document.addEventListener('pointermove', move);
+        document.addEventListener('pointerup', up);
+      };
       if (!wbStore.open) {
         return wrapOverlay(h('div', {
-          style: { position: 'fixed', right: 0, top: '42%', zIndex: dragRaise ? 2147483000 : 1000, pointerEvents: 'auto' },
+          style: { position: 'fixed', right: 0, top: handleTop, zIndex: dragRaise ? 2147483000 : 1000, pointerEvents: 'auto', touchAction: 'none', userSelect: 'none' },
+          onPointerDown: beginHandleDrag,
           onDragOver: (ev) => { ev.preventDefault(); ev.stopPropagation(); },
           onDrop: (ev) => {
             ev.preventDefault(); ev.stopPropagation();
@@ -1088,10 +1121,9 @@ window.__ModuleLoader__.load({
           },
         },
           h('button', {
-            onClick: () => setWb({ open: true }),
-            title: '打开工作台（也可把文件直接拖到此按钮上）',
+            title: '点击打开工作台；按住可沿右侧上下拖动；也可把文件直接拖到此按钮上',
             style: {
-              writingMode: 'vertical-rl', cursor: 'pointer', padding: '10px 6px',
+              writingMode: 'vertical-rl', cursor: 'grab', padding: '10px 6px',
               background: C.primary, color: C.white, border: '1px solid ' + C.primary,
               borderRight: 'none', borderRadius: '8px 0 0 8px', fontSize: 12, fontWeight: 600,
               boxShadow: '0 2px 12px rgba(0,0,0,0.4)',
@@ -1202,6 +1234,27 @@ window.__ModuleLoader__.load({
                 },
               }, '没有打开的文档：把文件拖到工作台，或在 VScode 面板点文件行的「编辑」；支持多标签页')
             : null,
+          wbStore.active === null
+            ? null
+            : h('div', {
+                'data-wb-gutter': '1',
+                'aria-hidden': 'true',
+                style: {
+                  position: 'absolute', left: 0, top: 0, bottom: 0, width: gutterWidth, zIndex: 3,
+                  overflow: 'hidden', pointerEvents: 'none', userSelect: 'none',
+                  background: 'rgba(28,28,32,0.97)', borderRight: '1px solid ' + C.btnBorder,
+                },
+              },
+                h('pre', {
+                  style: {
+                    margin: 0, width: '100%',
+                    fontFamily: 'Consolas, Menlo, "Courier New", monospace',
+                    fontSize: fontSize + 'px', lineHeight: 1.5,
+                    padding: '10px 6px 10px 4px', boxSizing: 'border-box',
+                    textAlign: 'right', color: C.textDim, whiteSpace: 'pre',
+                  },
+                }, gutterText)
+              ),
           h('pre', {
             ref: preRef,
             'aria-hidden': 'true',
@@ -1216,10 +1269,14 @@ window.__ModuleLoader__.load({
             onChange: (ev) => onTextChange(ev.target.value),
             onKeyDown: wbKeyDown,
             onScroll: (ev) => {
+              const t = ev.target;
               if (preRef.current) {
-                preRef.current.scrollTop = ev.target.scrollTop;
-                preRef.current.scrollLeft = ev.target.scrollLeft;
+                preRef.current.scrollTop = t.scrollTop;
+                preRef.current.scrollLeft = t.scrollLeft;
               }
+              const host = t.parentNode;
+              const g = host && host.querySelector ? host.querySelector('[data-wb-gutter]') : null;
+              if (g) g.scrollTop = t.scrollTop;
             },
             spellCheck: false,
             wrap: 'off',
@@ -1322,7 +1379,7 @@ window.__ModuleLoader__.load({
           order: 25,
         }, WorkbenchOverlay));
         // 诊断探针：客户端半体加载成功即写宿主侧标记文件（供排查「刷新后无图标」）。
-        call('clientLoaded', { href: String((typeof location !== 'undefined' && location.href) || ''), now: Date.now(), version: '1.1.1', portal: canPortal });
+        call('clientLoaded', { href: String((typeof location !== 'undefined' && location.href) || ''), now: Date.now(), version: '1.1.2', portal: canPortal });
       },
     };
   },

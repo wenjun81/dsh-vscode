@@ -1,6 +1,6 @@
 {
   "name": "@wenjun81/dsh-vscode",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "DSH sidebar panel that bridges VS Code: launch VS Code, browse workspaces, send files (as attachments) to the current conversation, and edit code in a floating multi-tab workbench with live sync.",
   "license": "MIT",
   "repository": {

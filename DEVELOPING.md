@@ -47,3 +47,4 @@ node --check index.js; node --check client.js   # 语法
 - 1.1.0 = 精简重构（功能不变）：删 attachments.saveFile 死分支与 v0.1 遗留端点（sendFileToDsh/sendTextToDsh/listSessions）、三路文本降级合并为 deliverTextFallback、四个 spawn 块合并为 launchVsCode、探针收敛（index.js 790→659 行 ≈ -17%，client.js logClient 17→7）。
 - 1.1.1 = 修复「发送失败：session ... is already owned by an active write handle」：GUI 打开对话后 agent 恢复（open('write')）尚未完成时，插件 prompt 撞写句柄被拒。新增 withWriterHeldRetry（对 code session/writer-held 或 message 含 active write handle 的错误重试 4 次、间隔 1.5s）；耗尽后返回明确指引文案。同时移除宿主错误消息里重复的「发送失败：」前缀（客户端已加）。
 - 1.1.1 发布时包名改为 @wenjun81/dsh-vscode（npm 上 dsh-vscode 已被他人 2026-08 占名）：package.json name、client.js 模块 id、index.js 导出 name、cordis.patch.yml 槽位 id/name 四处必须同步改，否则客户端半体静默不激活（见坑位 10）。
+- 1.1.2 = 体验改进：①右侧「工作台」把手可沿右侧上下来回拖动（pointer 拖动、视口钳制，单击仍打开工作台，拖文件投放不变）；②编辑器新增 VS Code 式行号栏（等宽右对齐、随垂直滚动同步、宽度随位数与字号自适应，代码区右移一个行号栏宽）。纯客户端改动，宿主半体与 v1.1.1 相同。
